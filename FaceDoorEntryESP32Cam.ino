@@ -376,9 +376,9 @@ void activate_output(WebsocketsClient &client) {
     activated = true;
     Serial.println("acivated");
     client.send("door_open");
-    activated_millis = millis(); // time relay closed and door opened
     xSemaphoreGive(commsMutex);
   }
+  activated_millis = millis(); // time relay closed and door opened
 }
 
 
@@ -397,9 +397,9 @@ void doRecognition(WebsocketsClient &client) {
   out_res.net_boxes = NULL;
   out_res.face_id = NULL;
   
-  xSemaphoreTake(commsMutex, portMAX_DELAY);
+  //xSemaphoreTake(commsMutex, portMAX_DELAY);
   out_res.net_boxes = face_detect(image, &mtmn_config);
-  xSemaphoreGive(commsMutex);
+  //xSemaphoreGive(commsMutex);
 
   // If any faces are detected
   if (out_res.net_boxes)
@@ -410,6 +410,7 @@ void doRecognition(WebsocketsClient &client) {
     xSemaphoreGive(commsMutex);
     if (aligned == ESP_OK)
     {
+      vTaskDelay((TickType_t) 1);
       xSemaphoreTake(commsMutex, portMAX_DELAY);
       out_res.face_id = get_face_id(aligned_face);
       xSemaphoreGive(commsMutex);
