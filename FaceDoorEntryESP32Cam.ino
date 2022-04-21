@@ -7,23 +7,14 @@
 #include "fd_forward.h"
 #include "fr_forward.h"
 #include "fr_flash.h"
-#include "fb_gfx.h"
+//#include "fb_gfx.h"
 #include "esp32-hal-cpu.h"
 
-const char* ssid = "NSA";
-const char* password = "Orange";
+const char* ssid = "";
+const char* password = "";
 
 #define ENROLL_CONFIRM_TIMES 5
 #define FACE_ID_SAVE_NUMBER 7
-
-#define FACE_COLOR_WHITE 0x00FFFFFF
-#define FACE_COLOR_BLACK 0x00000000
-#define FACE_COLOR_RED 0x000000FF
-#define FACE_COLOR_GREEN 0x0000FF00
-#define FACE_COLOR_BLUE 0x00FF0000
-#define FACE_COLOR_YELLOW (FACE_COLOR_RED | FACE_COLOR_GREEN)
-#define FACE_COLOR_CYAN (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
-#define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
 // Select camera model
 //#define CAMERA_MODEL_WROVER_KIT
@@ -38,21 +29,20 @@ using namespace websockets;
 // Globals
 static WebsocketsServer socket_server;
 static WebsocketsClient client;
-static QueueHandle_t imageAvailable;
-static QueueHandle_t imageUsed;
-static char imageTokenVar;
 static SemaphoreHandle_t commsMutex;
-dl_matrix3du_t *image = NULL;
+static dl_matrix3du_t *image = NULL;
 static camera_fb_t * fb = NULL;
 static TaskHandle_t TaskRec;
+static QueueHandle_t imageAvailable;
+static QueueHandle_t imageUsed;
+static char imageTokenVar = 0;
 
-long current_millis;
-long last_detected_millis = 0;
 
 #define relay_pin 2 // pin 12 can also be used
 static unsigned long activated_millis = 0;
 static const unsigned long activateDuration_ms = 5000; // activate for ... milliseconds
 static bool activated = false;
+static unsigned long last_detected_millis = 0;
 
 static void app_facenet_main();
 static void app_httpserver_init();
@@ -75,8 +65,8 @@ static inline mtmn_config_t app_mtmn_config()
   mtmn_config_t mtmn_config = {0};
   mtmn_config.type = FAST;
   mtmn_config.min_face = 50; // Allows slightly smaller face
-  //mtmn_config.pyramid = 0.707;
-  mtmn_config.pyramid = 0.5;
+  mtmn_config.pyramid = 0.707;
+  //mtmn_config.pyramid = 0.5;
   mtmn_config.pyramid_times = 4;
   mtmn_config.p_threshold.score = 0.6;
   mtmn_config.p_threshold.nms = 0.7;
@@ -89,11 +79,10 @@ static inline mtmn_config_t app_mtmn_config()
   mtmn_config.o_threshold.candidate_number = 1;
   return mtmn_config;
 }
+
 mtmn_config_t mtmn_config = app_mtmn_config();
-
-face_id_name_list st_face_list;
+face_id_name_list st_face_list = {0};
 static dl_matrix3du_t *aligned_face = NULL;
-
 httpd_handle_t camera_httpd = NULL;
 
 typedef enum
@@ -224,7 +213,7 @@ void setup() {
   }
   
   // Setup the recognition thread
-  xTaskCreatePinnedToCore(TaskRecognise,"TaskRecognise",15000,NULL,tskIDLE_PRIORITY+1,&TaskRec,0); 
+  xTaskCreatePinnedToCore(TaskRecognise,"TaskRecognise",20000,NULL,tskIDLE_PRIORITY+1,&TaskRec,0); 
 }
 
 // ----------------------------------------------
@@ -335,11 +324,7 @@ void app_facenet_main() {
 //
 // ----------------------------------------------
 static inline int do_enrollment(face_id_name_list *face_list, dl_matrix3d_t *new_id) {
-  ESP_LOGD(TAG, "START ENROLLING");
   int left_sample_face = enroll_face_id_to_flash_with_name(face_list, new_id, st_name.enroll_name);
-  ESP_LOGD(TAG, "Face ID %s Enrollment: Sample %d",
-           st_name.enroll_name,
-           ENROLL_CONFIRM_TIMES - left_sample_face);
   return left_sample_face;
 }
 
@@ -412,15 +397,22 @@ void doRecognition(WebsocketsClient &client) {
   out_res.net_boxes = NULL;
   out_res.face_id = NULL;
   
+  xSemaphoreTake(commsMutex, portMAX_DELAY);
   out_res.net_boxes = face_detect(image, &mtmn_config);
+  xSemaphoreGive(commsMutex);
 
   // If any faces are detected
   if (out_res.net_boxes)
   {
     // Align the faces
-    if (align_face(out_res.net_boxes, image, aligned_face) == ESP_OK)
+    xSemaphoreTake(commsMutex, portMAX_DELAY);
+    auto aligned = align_face(out_res.net_boxes, image, aligned_face);
+    xSemaphoreGive(commsMutex);
+    if (aligned == ESP_OK)
     {
+      xSemaphoreTake(commsMutex, portMAX_DELAY);
       out_res.face_id = get_face_id(aligned_face);
+      xSemaphoreGive(commsMutex);
             
       last_detected_millis = millis();
       if (g_state == START_DETECT) {
@@ -429,11 +421,12 @@ void doRecognition(WebsocketsClient &client) {
   
       if (g_state == START_ENROLL)
       {
+        xSemaphoreTake(commsMutex, portMAX_DELAY);
         int left_sample_face = do_enrollment(&st_face_list, out_res.face_id);
+        xSemaphoreGive(commsMutex);
         sprintf(recResponse1, "SAMPLE NUMBER %d FOR %s", ENROLL_CONFIRM_TIMES - left_sample_face, st_name.enroll_name);
         if (left_sample_face == 0)
         {
-          ESP_LOGI(TAG, "Enrolled Face ID: %s", st_face_list.tail->id_name);
           g_state = START_STREAM;
           sprintf(recResponse2, "FACE CAPTURED FOR %s", st_face_list.tail->id_name);
         }
@@ -441,7 +434,9 @@ void doRecognition(WebsocketsClient &client) {
   
       if (g_state == START_RECOGNITION  && (st_face_list.count > 0))
       {
+        xSemaphoreTake(commsMutex, portMAX_DELAY);
         face_id_node * face_id = recognize_face_with_name(&st_face_list, out_res.face_id);
+        xSemaphoreGive(commsMutex);
         if (face_id)
         {
           activate_output(client);
@@ -452,12 +447,16 @@ void doRecognition(WebsocketsClient &client) {
           strcpy(recResponse1,"FACE NOT RECOGNISED");
         }
       } // START_RECOGNITION and face list
+      xSemaphoreTake(commsMutex, portMAX_DELAY);
       dl_matrix3d_free(out_res.face_id);
+      xSemaphoreGive(commsMutex);
     } // align_face
+    xSemaphoreTake(commsMutex, portMAX_DELAY);
     dl_lib_free(out_res.net_boxes->score);  // Free allocated memory
     dl_lib_free(out_res.net_boxes->box); 
     dl_lib_free(out_res.net_boxes->landmark);
     dl_lib_free(out_res.net_boxes);
+    xSemaphoreGive(commsMutex);
   } 
   else // No net boxes
   {
@@ -574,7 +573,7 @@ void loop() {
     serviceWebPage();
 
     // Check if the output need to be turned off
-    if ( activated && ( (millis() - activated_millis) > activateDuration_ms )) { // current time - face recognised time > 5 secs
+    if ( activated && ( (millis() - activated_millis) > activateDuration_ms )) {
       digitalWrite(relay_pin, LOW); //open relay
       activated = false;
       Serial.println("De-activate");
@@ -598,21 +597,22 @@ void loop() {
         // Signal that the image is available
         if( xQueueSend( imageAvailable,( void * )&imageTokenVar, ( TickType_t ) portMAX_DELAY ) == pdPASS )
         {
-          vTaskDelay((TickType_t) 1);
-
           // Wait for the image to have been used
+          vTaskDelay((TickType_t) 1);
           xQueueReceive( imageUsed, (void*)&imageTokenVar, ( TickType_t ) portMAX_DELAY );
           vTaskDelay((TickType_t) 1);
-        }
-      }
+        } // Frame has been used
+      } // Recognition thread ready for new frame
     } // if running face detection
 
     // Send the frame to the web page
     clientSendBinary(client, (char *)fb->buf, fb->len);
 
     // Release the frame
+    xSemaphoreTake(commsMutex, portMAX_DELAY);
     esp_camera_fb_return(fb);
     fb = NULL;
+    xSemaphoreGive(commsMutex);
     
   } // while client available
 }
