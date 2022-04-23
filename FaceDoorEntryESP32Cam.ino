@@ -10,6 +10,8 @@
 //#include "fb_gfx.h"
 #include "esp32-hal-cpu.h"
 
+//#define USE_PWM
+
 const char* ssid = "";
 const char* password = "";
 
@@ -38,9 +40,25 @@ static QueueHandle_t imageUsed;
 static char imageTokenVar = 0;
 
 
-#define relay_pin 2 // pin 12 can also be used
+#ifdef USE_PWM
+#define activate_pin 4 // Built in LED
+#define active_on (4)
+#define active_off (1)
+
+#else
+#define activate_pin 2 // pin 12 can also be used
+#define active_on (HIGH)
+#define active_off (LOW)
+
+#endif
+// setting PWM properties
+const int freq = 5000;
+const int ledChannel = 0;
+const int pwmresolution = 8;
+ 
+
 static unsigned long activated_millis = 0;
-static const unsigned long activateDuration_ms = 5000; // activate for ... milliseconds
+static const unsigned long activateDuration_ms = 2000; // activate for ... milliseconds
 static bool activated = false;
 static unsigned long last_detected_millis = 0;
 
@@ -60,22 +78,27 @@ typedef struct
 // ----------------------------------------------
 //
 // ----------------------------------------------
+//#define lowThresh 0.6
+//#define highThresh 0.7
+#define lowThresh 0.2
+#define highThresh 0.3
 static inline mtmn_config_t app_mtmn_config()
 {
   mtmn_config_t mtmn_config = {0};
   mtmn_config.type = FAST;
+  //mtmn_config.type = NORMAL;
   mtmn_config.min_face = 50; // Allows slightly smaller face
   mtmn_config.pyramid = 0.707;
   //mtmn_config.pyramid = 0.5;
   mtmn_config.pyramid_times = 4;
-  mtmn_config.p_threshold.score = 0.6;
-  mtmn_config.p_threshold.nms = 0.7;
+  mtmn_config.p_threshold.score = lowThresh;
+  mtmn_config.p_threshold.nms = highThresh;
   mtmn_config.p_threshold.candidate_number = 20;
-  mtmn_config.r_threshold.score = 0.7;
-  mtmn_config.r_threshold.nms = 0.7;
+  mtmn_config.r_threshold.score = highThresh;
+  mtmn_config.r_threshold.nms = highThresh;
   mtmn_config.r_threshold.candidate_number = 10;
-  mtmn_config.o_threshold.score = 0.7;
-  mtmn_config.o_threshold.nms = 0.7;
+  mtmn_config.o_threshold.score = highThresh;
+  mtmn_config.o_threshold.nms = highThresh;
   mtmn_config.o_threshold.candidate_number = 1;
   return mtmn_config;
 }
@@ -126,8 +149,15 @@ void setup() {
   Serial.print(Freq);
   Serial.println(" MHz");
 
-  digitalWrite(relay_pin, LOW);
-  pinMode(relay_pin, OUTPUT);
+#ifdef USE_PWM
+  // attach the channel to the GPIO to be controlled
+  ledcSetup(ledChannel, freq, pwmresolution);
+  ledcWrite(ledChannel, active_off);
+  ledcAttachPin(activate_pin, ledChannel);
+#else
+  digitalWrite(activate_pin, active_off);
+  pinMode(activate_pin, OUTPUT);
+#endif
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -213,7 +243,7 @@ void setup() {
   }
   
   // Setup the recognition thread
-  xTaskCreatePinnedToCore(TaskRecognise,"TaskRecognise",20000,NULL,tskIDLE_PRIORITY+1,&TaskRec,0); 
+  xTaskCreatePinnedToCore(TaskRecognise,"TaskRecognise",30000,NULL,tskIDLE_PRIORITY+1,&TaskRec,0); 
 }
 
 // ----------------------------------------------
@@ -370,9 +400,13 @@ void handle_message(WebsocketsMessage msg) {
 // Turn on the output
 // ----------------------------------------------
 void activate_output(WebsocketsClient &client) {
-  if (digitalRead(relay_pin) == LOW) {
+  if (!activated) {
     xSemaphoreTake(commsMutex, portMAX_DELAY);
-    digitalWrite(relay_pin, HIGH); //activate pin
+#ifdef USE_PWM
+    ledcWrite(ledChannel, active_on);
+#else
+    digitalWrite(activate_pin, active_on); //activate pin
+#endif
     activated = true;
     Serial.println("acivated");
     client.send("door_open");
@@ -397,23 +431,16 @@ void doRecognition(WebsocketsClient &client) {
   out_res.net_boxes = NULL;
   out_res.face_id = NULL;
   
-  //xSemaphoreTake(commsMutex, portMAX_DELAY);
   out_res.net_boxes = face_detect(image, &mtmn_config);
-  //xSemaphoreGive(commsMutex);
 
   // If any faces are detected
   if (out_res.net_boxes)
   {
     // Align the faces
-    xSemaphoreTake(commsMutex, portMAX_DELAY);
-    auto aligned = align_face(out_res.net_boxes, image, aligned_face);
-    xSemaphoreGive(commsMutex);
-    if (aligned == ESP_OK)
+    if (align_face(out_res.net_boxes, image, aligned_face) == ESP_OK)
     {
       vTaskDelay((TickType_t) 1);
-      xSemaphoreTake(commsMutex, portMAX_DELAY);
       out_res.face_id = get_face_id(aligned_face);
-      xSemaphoreGive(commsMutex);
             
       last_detected_millis = millis();
       if (g_state == START_DETECT) {
@@ -422,9 +449,7 @@ void doRecognition(WebsocketsClient &client) {
   
       if (g_state == START_ENROLL)
       {
-        xSemaphoreTake(commsMutex, portMAX_DELAY);
         int left_sample_face = do_enrollment(&st_face_list, out_res.face_id);
-        xSemaphoreGive(commsMutex);
         sprintf(recResponse1, "SAMPLE NUMBER %d FOR %s", ENROLL_CONFIRM_TIMES - left_sample_face, st_name.enroll_name);
         if (left_sample_face == 0)
         {
@@ -435,9 +460,7 @@ void doRecognition(WebsocketsClient &client) {
   
       if (g_state == START_RECOGNITION  && (st_face_list.count > 0))
       {
-        xSemaphoreTake(commsMutex, portMAX_DELAY);
         face_id_node * face_id = recognize_face_with_name(&st_face_list, out_res.face_id);
-        xSemaphoreGive(commsMutex);
         if (face_id)
         {
           activate_output(client);
@@ -448,16 +471,12 @@ void doRecognition(WebsocketsClient &client) {
           strcpy(recResponse1,"FACE NOT RECOGNISED");
         }
       } // START_RECOGNITION and face list
-      xSemaphoreTake(commsMutex, portMAX_DELAY);
       dl_matrix3d_free(out_res.face_id);
-      xSemaphoreGive(commsMutex);
     } // align_face
-    xSemaphoreTake(commsMutex, portMAX_DELAY);
     dl_lib_free(out_res.net_boxes->score);  // Free allocated memory
     dl_lib_free(out_res.net_boxes->box); 
     dl_lib_free(out_res.net_boxes->landmark);
     dl_lib_free(out_res.net_boxes);
-    xSemaphoreGive(commsMutex);
   } 
   else // No net boxes
   {
@@ -575,7 +594,11 @@ void loop() {
 
     // Check if the output need to be turned off
     if ( activated && ( (millis() - activated_millis) > activateDuration_ms )) {
-      digitalWrite(relay_pin, LOW); //open relay
+#ifdef USE_PWM      
+      ledcWrite(ledChannel, active_off);
+#else
+      digitalWrite(activate_pin, active_off); 
+#endif      
       activated = false;
       Serial.println("De-activate");
     }
